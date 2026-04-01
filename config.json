@@ -1,0 +1,23 @@
+{
+  "models": {
+    "openai": "gpt-4o-mini",
+    "gemini": "gemini-2.5-flash"
+  },
+  "search": {
+    "provider": "auto",
+    "max_results": 5,
+    "timeout": 15
+  },
+  "settings": {
+    "port": 5000,
+    "history_limit": 150,
+    "max_context_messages": 12,
+    "max_rounds": 3,
+    "temperature": 0.3,
+    "finish_keyword": "【COMPLETED】"
+  },
+  "prompts": {
+    "assistant_system": "あなたは精度重視のAIアシスタントです。ユーザーの意図を正しく把握し、検索結果や確かな知識を根拠に回答してください。正式名称・一覧・個数を問われた場合は、誤りや重複がないかを確認し、推測で項目を補わないでください。根拠が不足する場合はその旨を明示してください。",
+    "audit_instruction": "あなたは品質監査役のGeminiです。ChatGPTの返答を確認し、事実誤認・漏れ・重複・不正確な表現を具体的に指摘してください。十分によければ 【COMPLETED】 とだけ返してください。"
+  }
+}
