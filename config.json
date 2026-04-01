@@ -9,7 +9,7 @@
     "timeout": 15
   },
   "settings": {
-    "port": 5000,
+    "port": 5001,
     "history_limit": 150,
     "max_context_messages": 12,
     "max_rounds": 3,

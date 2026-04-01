@@ -9,7 +9,10 @@ const loading = ref(false)
 const statusText = ref('会話を開始してください。')
 const error = ref('')
 const provider = ref('auto')
+const openaiConfigured = ref(false)
 const geminiConfigured = ref(false)
+const useChatgpt = ref(true)
+const useGemini = ref(true)
 const chatWindowRef = ref(null)
 const showTyping = ref(false)
 const typingRole = ref('chatgpt')
@@ -123,9 +126,11 @@ const loadHealth = async () => {
     const response = await fetch('/api/health')
     const data = await response.json()
     provider.value = data.search_provider || 'auto'
+    openaiConfigured.value = Boolean(data.openai_configured)
     geminiConfigured.value = Boolean(data.gemini_configured)
   } catch {
     provider.value = 'auto'
+    openaiConfigured.value = false
     geminiConfigured.value = false
   }
 }
@@ -216,7 +221,9 @@ const runDebate = async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         question: trimmedTopic,
-        rounds: Number(rounds.value) || 2
+        rounds: Number(rounds.value) || 2,
+        use_chatgpt: useChatgpt.value,
+        use_gemini: useGemini.value
       })
     })
     const data = await response.json()
@@ -251,7 +258,7 @@ onMounted(async () => {
       <div>
         <h1>💬 AI Debate Chat</h1>
         <p class="subtitle">
-          ユーザー入力に対して ChatGPT が回答し、Gemini がレビューして、必要なら GPT が改善します。
+          入力に対して ChatGPT が回答し、Gemini がレビューして、必要なら GPT が改善します。
         </p>
       </div>
 
@@ -270,9 +277,36 @@ onMounted(async () => {
           </span>
         </label>
         <span class="pill">Search: {{ providerLabel }}</span>
-        <span class="pill" :class="{ active: geminiConfigured }">
-          Gemini: {{ geminiConfigured ? 'ON' : 'OFF' }}
-        </span>
+        <label
+          v-if="openaiConfigured"
+          class="pill checkbox-pill"
+          :class="{ enabled: useChatgpt, disabled: !useChatgpt }"
+        >
+          <input v-model="useChatgpt" type="checkbox">
+          <span class="switch-track" aria-hidden="true">
+            <span class="switch-thumb"></span>
+          </span>
+          <span class="toggle-label">
+            ChatGPT
+            <strong class="toggle-state">{{ useChatgpt ? 'ON' : 'OFF' }}</strong>
+          </span>
+        </label>
+        <span v-else class="pill">ChatGPT: OFF</span>
+        <label
+          v-if="geminiConfigured"
+          class="pill checkbox-pill"
+          :class="{ enabled: useGemini, disabled: !useGemini }"
+        >
+          <input v-model="useGemini" type="checkbox">
+          <span class="switch-track" aria-hidden="true">
+            <span class="switch-thumb"></span>
+          </span>
+          <span class="toggle-label">
+            Gemini
+            <strong class="toggle-state">{{ useGemini ? 'ON' : 'OFF' }}</strong>
+          </span>
+        </label>
+        <span v-else class="pill">Gemini: OFF</span>
       </div>
     </header>
 
@@ -438,16 +472,26 @@ pre {
   margin: 0 0 6px;
 }
 
+.app-header > div:first-child {
+  flex-shrink: 0;
+  min-width: max-content;
+}
+
 .subtitle {
+  display: block;
   margin: 4px 0;
   color: #e5e7eb;
-  max-width: 760px;
+  width: max-content;
+  max-width: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .header-pills {
   display: flex;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   margin-left: auto;
   justify-content: flex-end;
   align-items: center;
@@ -462,6 +506,7 @@ pre {
   color: #f8fafc;
   font-size: 13px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .checkbox-pill {
@@ -470,6 +515,7 @@ pre {
   user-select: none;
   border: 1px solid rgba(255, 255, 255, 0.22);
   transition: background 0.2s ease, border-color 0.2s ease, transform 0.2s ease;
+  white-space: nowrap;
 }
 
 .checkbox-pill.enabled {

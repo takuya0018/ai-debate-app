@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import socket
 from datetime import datetime
 from html import unescape
 from pathlib import Path
@@ -31,7 +32,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "timeout": 15
     },
     "settings": {
-        "port": 5000,
+        "port": 5001,
         "history_limit": 150,
         "max_context_messages": 12,
         "max_rounds": 3,
@@ -54,6 +55,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 app = Flask(__name__)
+
+
+def find_available_port(preferred_port: int, max_attempts: int = 20) -> int:
+    for offset in range(max_attempts):
+        candidate_port = preferred_port + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", candidate_port))
+                return candidate_port
+            except OSError:
+                continue
+
+    raise RuntimeError(
+        f"ポート {preferred_port} から {preferred_port + max_attempts - 1} まで使用中のため起動できません。"
+    )
 
 
 def deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -184,6 +201,25 @@ WEATHER_QUERY_KEYWORDS = (
     "weather", "forecast", "temperature"
 )
 
+SEARCH_INTENT_KEYWORDS = (
+    "とは", "意味", "教えて", "調べ", "検索", "最新", "ニュース", "公式", "比較",
+    "一覧", "方法", "手順", "原因", "エラー", "how", "what", "why", "where", "when"
+)
+
+CASUAL_CHAT_NORMALIZED = {
+    "おはよう", "こんにちは", "こんばんは", "やあ", "どうも", "ありがとう", "ありがと", "了解",
+    "よろしく", "よろしくね", "元気", "おつかれ", "お疲れ", "はじめまして", "ただいま", "おやすみ"
+}
+
+SMALL_TALK_REPLIES = {
+    "おはよう": "おはようございます。",
+    "こんにちは": "こんにちは。",
+    "こんばんは": "こんばんは。",
+    "ありがとう": "どういたしまして。",
+    "ありがと": "どういたしまして。",
+    "おやすみ": "おやすみなさい。",
+}
+
 SPECIAL_SEARCH_VARIANTS = {
     "ストレングスファインダー": [
         "StrengthsFinder 34 themes official",
@@ -225,6 +261,34 @@ def is_weather_query(query: str) -> bool:
     )
 
 
+def should_use_web_search(query: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", str(query or "")).strip()
+    if not cleaned:
+        return False
+
+    if is_weather_query(cleaned):
+        return True
+
+    normalized = re.sub(r"[\s!?！？。,.、]+", "", cleaned.lower())
+    if normalized in CASUAL_CHAT_NORMALIZED:
+        return False
+
+    if any(keyword in cleaned.lower() for keyword in SEARCH_INTENT_KEYWORDS):
+        return True
+
+    if "?" in cleaned or "？" in cleaned:
+        return True
+
+    return False
+
+
+def build_small_talk_reply(query: str) -> str | None:
+    normalized = re.sub(r"[\s!?！？。,.、]+", "", str(query or "").lower())
+    if normalized in SMALL_TALK_REPLIES:
+        return SMALL_TALK_REPLIES[normalized]
+    return None
+
+
 def weather_code_to_text(code: Any) -> str:
     try:
         numeric_code = int(code)
@@ -260,8 +324,76 @@ def extract_weather_location(query: str) -> str:
     return filtered[0] if filtered else "東京"
 
 
+def extract_weather_day_offset(query: str) -> int:
+    if "明後日" in query:
+        return 2
+    if "明日" in query:
+        return 1
+    return 0
+
+
+def needs_clothing_advice(query: str) -> bool:
+    return any(keyword in query for keyword in ("服", "服装", "着る", "コーデ"))
+
+
+def build_weather_answer(item: Dict[str, str], query: str) -> str:
+    lines = [f"{item.get('day_label', '今日')}（{item.get('date', '')}）の{item.get('location', '東京')}の天気です。"]
+
+    current_temp = item.get("current_temp", "")
+    weather_text = item.get("weather", "不明")
+    if current_temp:
+        lines.append(f"現在の天気は{weather_text}、気温は{current_temp}°Cです。")
+    else:
+        lines.append(f"天気は{weather_text}です。")
+
+    forecast_parts = []
+    if item.get("max_temp"):
+        forecast_parts.append(f"最高気温は{item['max_temp']}°C")
+    if item.get("min_temp"):
+        forecast_parts.append(f"最低気温は{item['min_temp']}°C")
+    if item.get("rain_probability"):
+        forecast_parts.append(f"降水確率は{item['rain_probability']}%")
+    if item.get("wind_speed"):
+        forecast_parts.append(f"風速は{item['wind_speed']} km/h")
+    if forecast_parts:
+        lines.append("、".join(forecast_parts) + "です。")
+
+    if needs_clothing_advice(query):
+        advice_parts = []
+        try:
+            max_temp_value = float(item.get("max_temp", ""))
+        except (TypeError, ValueError):
+            max_temp_value = None
+        try:
+            rain_probability_value = int(float(item.get("rain_probability", "")))
+        except (TypeError, ValueError):
+            rain_probability_value = None
+
+        if max_temp_value is not None:
+            if max_temp_value <= 12:
+                advice_parts.append("厚手の上着やコートがあると安心です")
+            elif max_temp_value <= 18:
+                advice_parts.append("ライトアウターやカーディガンがあるとちょうどよいです")
+            elif max_temp_value <= 24:
+                advice_parts.append("長袖シャツや薄手の羽織りがおすすめです")
+            else:
+                advice_parts.append("半袖中心で過ごしやすい気温です")
+
+        if rain_probability_value is not None and rain_probability_value >= 50:
+            advice_parts.append("雨に備えて折りたたみ傘や撥水の上着があると便利です")
+
+        if advice_parts:
+            lines.append("服装の目安としては、" + "、".join(advice_parts) + "。")
+
+    if item.get("url"):
+        lines.append(f"詳細: {item['url']}")
+
+    return "\n".join(lines)
+
+
 def search_weather_with_open_meteo(query: str, timeout: int) -> List[Dict[str, str]]:
     location = extract_weather_location(query) or "東京"
+    day_offset = extract_weather_day_offset(query)
 
     geo_response = requests.get(
         "https://geocoding-api.open-meteo.com/v1/search",
@@ -287,7 +419,7 @@ def search_weather_with_open_meteo(query: str, timeout: int) -> List[Dict[str, s
             "current": "temperature_2m,weather_code,wind_speed_10m",
             "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max",
             "timezone": timezone,
-            "forecast_days": 1,
+            "forecast_days": max(2, day_offset + 1),
         },
         timeout=timeout,
     )
@@ -296,10 +428,17 @@ def search_weather_with_open_meteo(query: str, timeout: int) -> List[Dict[str, s
 
     current = forecast_payload.get("current", {})
     daily = forecast_payload.get("daily", {})
-    today = (daily.get("time") or [current.get("time", "")[:10]])[0]
-    max_temp = (daily.get("temperature_2m_max") or [None])[0]
-    min_temp = (daily.get("temperature_2m_min") or [None])[0]
-    rain_probability = (daily.get("precipitation_probability_max") or [None])[0]
+    daily_dates = daily.get("time") or [current.get("time", "")[:10]]
+    selected_index = min(day_offset, max(0, len(daily_dates) - 1))
+    target_date = daily_dates[selected_index]
+    max_temp = (daily.get("temperature_2m_max") or [None])[selected_index]
+    min_temp = (daily.get("temperature_2m_min") or [None])[selected_index]
+    rain_probability = (daily.get("precipitation_probability_max") or [None])[selected_index]
+    weather_code = (daily.get("weather_code") or [current.get("weather_code")])[selected_index]
+    weather_text = weather_code_to_text(current.get("weather_code") if day_offset == 0 else weather_code)
+    current_temp = "" if day_offset > 0 else str(current.get("temperature_2m", ""))
+    wind_speed = "" if day_offset > 0 else str(current.get("wind_speed_10m", ""))
+    day_label = "明後日" if day_offset == 2 else "明日" if day_offset == 1 else "今日"
 
     display_name = str(place.get("name", location)).strip() or location
     admin1 = str(place.get("admin1", "")).strip()
@@ -307,21 +446,43 @@ def search_weather_with_open_meteo(query: str, timeout: int) -> List[Dict[str, s
         display_name = f"{display_name} ({admin1})"
 
     snippet = (
-        f"{today} の {display_name} の天気。"
-        f"現在 {weather_code_to_text(current.get('weather_code'))}、"
-        f"気温 {current.get('temperature_2m')}°C、風速 {current.get('wind_speed_10m')} km/h。"
-        f"今日の最高 {max_temp}°C、最低 {min_temp}°C、降水確率 {rain_probability}%。"
+        f"{target_date} の {display_name} の天気。"
+        f"{'現在 ' + weather_text + '、気温 ' + current_temp + '°C、風速 ' + wind_speed + ' km/h。' if day_offset == 0 else weather_text + '。'}"
+        f"{day_label}の最高 {max_temp}°C、最低 {min_temp}°C、降水確率 {rain_probability}%。"
     )
 
     return [{
         "title": f"{display_name} の天気 (Open-Meteo)",
         "url": f"https://open-meteo.com/en/docs?latitude={latitude}&longitude={longitude}",
         "snippet": snippet,
+        "location": display_name,
+        "date": str(target_date),
+        "day_label": day_label,
+        "weather": weather_text,
+        "current_temp": current_temp,
+        "max_temp": str(max_temp),
+        "min_temp": str(min_temp),
+        "rain_probability": str(rain_probability),
+        "wind_speed": wind_speed,
     }]
 
 
 def build_search_queries(query: str) -> List[str]:
-    base = re.sub(r"[?？!！。]+", " ", query).strip()
+    # Keep search terms compact so GET-based search APIs do not exceed URL limits.
+    source = re.sub(r"```[\s\S]*?```", " ", query)
+    source = re.sub(r"`[^`]*`", " ", source)
+    source = re.sub(r"https?://\S+", " ", source)
+    source = re.sub(r"[\r\n\t]+", " ", source)
+
+    token_pattern = r"[A-Za-z0-9_+\-\.]{2,}|[ぁ-んァ-ンー一-龥]{2,}"
+    tokens = re.findall(token_pattern, source)
+    compact = " ".join(tokens[:24]).strip()
+
+    if not compact:
+        compact = source.strip()
+
+    max_query_length = int(config.get("search", {}).get("max_query_length", 220))
+    base = re.sub(r"[?？!！。]+", " ", compact).strip()[:max_query_length]
     variants: List[str] = []
 
     def add(candidate: str) -> None:
@@ -492,10 +653,14 @@ def search_with_bing(query: str, max_results: int, timeout: int) -> List[Dict[st
 
 
 def search_with_duckduckgo(query: str, max_results: int, timeout: int) -> List[Dict[str, str]]:
+    trimmed_query = query[:220].strip()
+    if not trimmed_query:
+        return []
+
     response = requests.get(
         "https://api.duckduckgo.com/",
         params={
-            "q": query,
+            "q": trimmed_query,
             "format": "json",
             "no_redirect": 1,
             "no_html": 1,
@@ -514,7 +679,7 @@ def search_with_duckduckgo(query: str, max_results: int, timeout: int) -> List[D
 
     if abstract_text or abstract_url:
         results.append({
-            "title": heading or query,
+            "title": heading or trimmed_query,
             "url": abstract_url,
             "snippet": abstract_text
         })
@@ -553,21 +718,33 @@ def search_web(query: str) -> Tuple[str, List[Dict[str, str]]]:
 
     for candidate in query_variants:
         if provider == "serpapi":
-            results = search_with_serpapi(candidate, max_results, timeout)
-            if results:
-                return provider, results
+            try:
+                results = search_with_serpapi(candidate, max_results, timeout)
+                if results:
+                    return provider, results
+            except requests.RequestException:
+                pass
         elif provider == "bing":
-            results = search_with_bing(candidate, max_results, timeout)
-            if results:
-                return provider, results
+            try:
+                results = search_with_bing(candidate, max_results, timeout)
+                if results:
+                    return provider, results
+            except requests.RequestException:
+                pass
 
-        ddg_results = search_with_duckduckgo(candidate, max_results, timeout)
-        if ddg_results:
-            return "duckduckgo", ddg_results
+        try:
+            ddg_results = search_with_duckduckgo(candidate, max_results, timeout)
+            if ddg_results:
+                return "duckduckgo", ddg_results
+        except requests.RequestException:
+            pass
 
-        wiki_results = search_with_wikipedia(candidate, max_results, timeout)
-        if wiki_results:
-            return "wikipedia", wiki_results
+        try:
+            wiki_results = search_with_wikipedia(candidate, max_results, timeout)
+            if wiki_results:
+                return "wikipedia", wiki_results
+        except requests.RequestException:
+            pass
 
     return provider if provider in {"serpapi", "bing"} else "duckduckgo", []
 
@@ -661,6 +838,27 @@ def ask_chatgpt(messages: List[Dict[str, str]], *, temperature: float | None = N
     return (response.choices[0].message.content or "").strip()
 
 
+def ask_chatgpt_review_of_gemini(answer: str, topic: str, results: List[Dict[str, str]], provider: str) -> str:
+    return ask_chatgpt([
+        {
+            "role": "system",
+            "content": (
+                "あなたは建設的なレビュアーです。Geminiの回答を評価してください。"
+                "問題がなければ【COMPLETED】とだけ返してください。"
+                "問題がある場合は、良い点・改善点・修正方針を簡潔に示してください。"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"ユーザー要望:\n{topic}\n\n"
+                f"参照情報 ({provider or 'search'}):\n{format_sources_for_prompt(results)}\n\n"
+                f"Gemini の回答:\n{answer}"
+            ),
+        },
+    ], temperature=0.1)
+
+
 def ask_fallback_reviewer(content: str, topic: str, results: List[Dict[str, str]], provider: str, reason: str) -> Dict[str, Any]:
     try:
         review_text = ask_chatgpt([
@@ -705,8 +903,41 @@ def ask_fallback_reviewer(content: str, topic: str, results: List[Dict[str, str]
         }
 
 
-def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider: str) -> Dict[str, Any]:
+def ask_fallback_initial_answer(topic: str, results: List[Dict[str, str]], provider: str, reason: str) -> Dict[str, Any]:
+    try:
+        answer_text = ask_chatgpt([
+            {
+                "role": "system",
+                "content": config["prompts"]["assistant_system"],
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"ユーザーの依頼:\n{topic}\n\n"
+                    f"参照情報 ({provider or 'search'}):\n{format_sources_for_prompt(results)}\n\n"
+                    "上の参照情報を踏まえて回答してください。"
+                ),
+            },
+        ], temperature=0.2)
+        return {
+            "ok": True,
+            "content": answer_text,
+            "reason": f"fallback_openai:{reason}",
+            "speaker": "Gemini (fallback)",
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "content": "Gemini から回答を取得できず、代替回答も失敗しました。",
+            "reason": reason,
+            "speaker": "Gemini",
+        }
+
+
+def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider: str, is_initial: bool = False) -> Dict[str, Any]:
     if not GEMINI_API_KEY:
+        if is_initial:
+            return ask_fallback_initial_answer(topic, results, provider, "missing_api_key")
         return ask_fallback_reviewer(content, topic, results, provider, "missing_api_key")
 
     fallback_models = []
@@ -714,26 +945,39 @@ def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider
         if model_name and model_name not in fallback_models:
             fallback_models.append(model_name)
 
+    if is_initial:
+        prompt_text = (
+            "あなたは精度重視のAIアシスタントです。ユーザーの意図を正しく把握し、"
+            "検索結果や確かな知識を根拠に回答してください。正式名称・一覧・個数を問われた場合は、"
+            "誤りや重複がないかを確認し、推測で項目を補わないでください。"
+            "根拠が不足する場合はその旨を明示してください。\n\n"
+            f"ユーザーの依頼:\n{topic}\n\n"
+            f"参照情報 ({provider or 'search'}):\n{format_sources_for_prompt(results)}\n\n"
+            "上の参照情報を踏まえて、ユーザーの依頼に回答してください。"
+        )
+    else:
+        prompt_text = (
+            "あなたは建設的なレビュアーです。ChatGPT の回答を評価する際は次の形式を厳守してください:\n"
+            "問題がなければ 【COMPLETED】 とだけ返してください。\n\n"
+            "問題がある場合:\n"
+            "**いいところ:**\n"
+            "- 良い点1\n"
+            "- 良い点2\n\n"
+            "**改善点:**\n"
+            "- 改善すべき点1\n"
+            "- 改善すべき点2\n\n"
+            "**修正方針:**\n"
+            "- 対応1\n"
+            "- 対応2\n\n"
+            f"ユーザー要望:\n{topic}\n\n"
+            f"参照情報 ({provider or 'search'}):\n{format_sources_for_prompt(results)}\n\n"
+            f"ChatGPT の回答:\n{content}"
+        )
+
     payload = {
         "contents": [{
             "parts": [{
-                "text": (
-                    "あなたは建設的なレビュアーです。ChatGPT の回答を評価する際は次の形式を厳守してください:\n"
-                    "問題がなければ 【COMPLETED】 とだけ返してください。\n\n"
-                    "問題がある場合:\n"
-                    "**いいところ:**\n"
-                    "- 良い点1\n"
-                    "- 良い点2\n\n"
-                    "**改善点:**\n"
-                    "- 改善すべき点1\n"
-                    "- 改善すべき点2\n\n"
-                    "**修正方針:**\n"
-                    "- 対応1\n"
-                    "- 対応2\n\n"
-                    f"ユーザー要望:\n{topic}\n\n"
-                    f"参照情報 ({provider or 'search'}):\n{format_sources_for_prompt(results)}\n\n"
-                    f"ChatGPT の回答:\n{content}"
-                )
+                "text": prompt_text
             }]
         }]
     }
@@ -760,12 +1004,16 @@ def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider
                 body_text = response.text or ""
                 lowered = body_text.lower()
                 if response.status_code == 429 or "resource_exhausted" in lowered or "quota exceeded" in lowered:
+                    if is_initial:
+                        return ask_fallback_initial_answer(topic, results, provider, "quota_exceeded")
                     return ask_fallback_reviewer(content, topic, results, provider, "quota_exceeded")
 
                 last_error = f"Model '{model_id}' / Status {response.status_code}: {body_text}"
             except Exception as exc:
                 last_error = f"Model '{model_id}' / {exc}"
 
+    if is_initial:
+        return ask_fallback_initial_answer(topic, results, provider, last_error or "unknown_error")
     return ask_fallback_reviewer(content, topic, results, provider, last_error or "unknown_error")
 
 
@@ -889,8 +1137,14 @@ def ask() -> Any:
     except (TypeError, ValueError):
         requested_rounds = 2
 
+    use_chatgpt = bool(data.get("use_chatgpt", True))
+    use_gemini = bool(data.get("use_gemini", True))
+
+    if not use_chatgpt and not use_gemini:
+        return jsonify({"error": "少なくともChatGPTまたはGeminiを有効にしてください。"}), 400
+
     max_rounds = int(config["settings"].get("max_rounds", 3))
-    rounds = max(1, min(requested_rounds, max_rounds))
+    rounds = max(1, min(requested_rounds, max_rounds)) if use_chatgpt and use_gemini else 1
 
     if not topic:
         return jsonify({"error": "質問を入力してください。"}), 400
@@ -902,95 +1156,177 @@ def ask() -> Any:
 
     new_messages: List[Dict[str, Any]] = []
     warning = None
+    provider = "none"
+    search_results: List[Dict[str, str]] = []
+    current_answer = ""
 
     try:
-        provider, search_results = search_web(topic)
-        search_message = build_search_message(provider, search_results)
-        history.append(search_message)
-        new_messages.append(search_message)
-        save_history(history)
+        small_talk_reply = build_small_talk_reply(topic)
 
-        current_answer = ask_chatgpt(build_chatgpt_messages(
-            history[:-1],
-            (
-                f"ユーザーの依頼:\n{topic}\n\n"
-                "まずは質問に正面から答えてください。"
-                "正式名称・一覧・個数を求められている場合は、誤りや重複がないように確認し、"
-                "根拠が弱い項目は推測で追加しないでください。"
-            ),
-            search_results,
-            provider,
-        ), temperature=0.2)
+        if small_talk_reply:
+            current_answer = small_talk_reply
+            if use_gemini and not use_chatgpt:
+                initial_message = make_message("gemini", "Gemini", current_answer, 0)
+            else:
+                initial_message = make_message("chatgpt", "ChatGPT", current_answer, 0)
+            history.append(initial_message)
+            new_messages.append(initial_message)
+            save_history(history)
+        else:
+            should_search = should_use_web_search(topic)
+
+            if should_search:
+                provider, search_results = search_web(topic)
+                search_message = build_search_message(provider, search_results)
+                history.append(search_message)
+                new_messages.append(search_message)
+                save_history(history)
+
+            if provider == "open-meteo" and search_results:
+                current_answer = build_weather_answer(search_results[0], topic)
+
+            elif use_chatgpt and not use_gemini:
+                current_answer = ask_chatgpt(build_chatgpt_messages(
+                    history[:-1],
+                    (
+                        f"ユーザーの依頼:\n{topic}\n\n"
+                        "まずは質問に正面から答えてください。"
+                        "正式名称・一覧・個数を求められている場合は、誤りや重複がないように確認し、"
+                        "根拠が弱い項目は推測で追加しないでください。"
+                    ),
+                    search_results if should_search else None,
+                    provider if should_search else "",
+                ), temperature=0.2)
+                chatgpt_message = make_message(
+                    "chatgpt",
+                    "ChatGPT",
+                    current_answer,
+                    0,
+                    sources=search_results,
+                    provider=provider,
+                )
+                history.append(chatgpt_message)
+                new_messages.append(chatgpt_message)
+                save_history(history)
+
+            elif use_gemini and not use_chatgpt:
+                gemini_result = ask_gemini("", topic, search_results, provider, is_initial=True)
+                current_answer = gemini_result["content"]
+                gemini_message = make_message(
+                    "gemini",
+                    str(gemini_result.get("speaker", "Gemini")),
+                    current_answer,
+                    0,
+                    sources=search_results,
+                    provider=provider,
+                )
+                history.append(gemini_message)
+                new_messages.append(gemini_message)
+                save_history(history)
+
+                if OPENAI_API_KEY:
+                    gpt_review = ask_chatgpt_review_of_gemini(current_answer, topic, search_results, provider)
+                    gpt_review_message = make_message(
+                        "chatgpt",
+                        "ChatGPT (評価)",
+                        gpt_review,
+                        1,
+                        sources=search_results,
+                        provider=provider,
+                    )
+                    history.append(gpt_review_message)
+                    new_messages.append(gpt_review_message)
+                    save_history(history)
+                else:
+                    warning = "ChatGPT評価を有効化できませんでした。OPENAI_API_KEY を設定してください。"
+
+            else:
+                current_answer = ask_chatgpt(build_chatgpt_messages(
+                    history[:-1],
+                    (
+                        f"ユーザーの依頼:\n{topic}\n\n"
+                        "まずは質問に正面から答えてください。"
+                        "正式名称・一覧・個数を求められている場合は、誤りや重複がないように確認し、"
+                        "根拠が弱い項目は推測で追加しないでください。"
+                    ),
+                    search_results if should_search else None,
+                    provider if should_search else "",
+                ), temperature=0.2)
+                chatgpt_message = make_message(
+                    "chatgpt",
+                    "ChatGPT",
+                    current_answer,
+                    0,
+                    sources=search_results,
+                    provider=provider,
+                )
+                history.append(chatgpt_message)
+                new_messages.append(chatgpt_message)
+                save_history(history)
+
+                for round_index in range(rounds):
+                    gemini_result = ask_gemini(current_answer, topic, search_results, provider)
+                    feedback = gemini_result["content"]
+
+                    gemini_message = make_message(
+                        "gemini",
+                        str(gemini_result.get("speaker", "Gemini")),
+                        feedback,
+                        round_index + 1,
+                    )
+                    history.append(gemini_message)
+                    new_messages.append(gemini_message)
+                    save_history(history)
+
+                    if not gemini_result["ok"]:
+                        warning = feedback
+                        break
+
+                    if config["settings"]["finish_keyword"] in feedback:
+                        break
+
+                    revision_prompt = (
+                        f"元のユーザー要望:\n{topic}\n\n"
+                        f"前回のChatGPT回答:\n{current_answer}\n\n"
+                        f"Gemini の指摘:\n{feedback}\n\n"
+                        "次のルールで回答を全面修正してください。\n"
+                        "- Gemini の指摘を1つ残らず反映する\n"
+                        "- 事実誤認、重複、正式名称のズレを必ず直す\n"
+                        "- 正式な一覧や個数を求められている場合は、誤りがある項目は削除または修正する\n"
+                        "- 検索結果で裏づけられない推測は書かない\n"
+                        "- 出力形式を厳守する\n\n"
+                        "出力形式:\n"
+                        "[REVISION_PLAN]\n"
+                        "- 指摘と対応を1対1で短く列挙\n"
+                        "- 2-5項目\n\n"
+                        "[REVISED_ANSWER]\n"
+                        "(修正後の回答本文のみ)"
+                    )
+                    revision_raw = ask_chatgpt(
+                        build_chatgpt_messages(
+                            history,
+                            revision_prompt,
+                            search_results if should_search else None,
+                            provider if should_search else "",
+                        ),
+                        temperature=0.1,
+                    )
+                    revision_plan, revised_answer = split_revision_output(revision_raw)
+                    current_answer = revised_answer or revision_raw
+                    revised_message = make_message(
+                        "chatgpt",
+                        "ChatGPT",
+                        current_answer,
+                        round_index + 1,
+                        sources=search_results,
+                        provider=provider,
+                    )
+                    history.append(revised_message)
+                    new_messages.append(revised_message)
+                    save_history(history)
+
     except Exception as exc:
         return jsonify({"error": f"回答生成に失敗しました: {exc}"}), 500
-
-    chatgpt_message = make_message(
-        "chatgpt",
-        "ChatGPT",
-        current_answer,
-        0,
-        sources=search_results,
-        provider=provider,
-    )
-    history.append(chatgpt_message)
-    new_messages.append(chatgpt_message)
-    save_history(history)
-
-    for round_index in range(rounds):
-        gemini_result = ask_gemini(current_answer, topic, search_results, provider)
-        feedback = gemini_result["content"]
-
-        gemini_message = make_message(
-            "gemini",
-            str(gemini_result.get("speaker", "Gemini")),
-            feedback,
-            round_index + 1,
-        )
-        history.append(gemini_message)
-        new_messages.append(gemini_message)
-        save_history(history)
-
-        if not gemini_result["ok"]:
-            warning = feedback
-            break
-
-        if config["settings"]["finish_keyword"] in feedback:
-            break
-
-        revision_prompt = (
-            f"元のユーザー要望:\n{topic}\n\n"
-            f"前回のChatGPT回答:\n{current_answer}\n\n"
-            f"Gemini の指摘:\n{feedback}\n\n"
-            "次のルールで回答を全面修正してください。\n"
-            "- Gemini の指摘を1つ残らず反映する\n"
-            "- 事実誤認、重複、正式名称のズレを必ず直す\n"
-            "- 正式な一覧や個数を求められている場合は、誤りがある項目は削除または修正する\n"
-            "- 検索結果で裏づけられない推測は書かない\n"
-            "- 出力形式を厳守する\n\n"
-            "出力形式:\n"
-            "[REVISION_PLAN]\n"
-            "- 指摘と対応を1対1で短く列挙\n"
-            "- 2-5項目\n\n"
-            "[REVISED_ANSWER]\n"
-            "(修正後の回答本文のみ)"
-        )
-        revision_raw = ask_chatgpt(
-            build_chatgpt_messages(history, revision_prompt, search_results, provider),
-            temperature=0.1,
-        )
-        revision_plan, revised_answer = split_revision_output(revision_raw)
-        current_answer = revised_answer or revision_raw
-        revised_message = make_message(
-            "chatgpt",
-            "ChatGPT",
-            current_answer,
-            round_index + 1,
-            sources=search_results,
-            provider=provider,
-        )
-        history.append(revised_message)
-        new_messages.append(revised_message)
-        save_history(history)
 
     final_with_summary = add_summary_section(current_answer)
 
@@ -1006,4 +1342,13 @@ def ask() -> Any:
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=int(config["settings"].get("port", 5000)))
+    configured_port = int(config["settings"].get("port", 5000))
+    existing_selected_port = os.getenv("APP_SELECTED_PORT", "").strip()
+    selected_port = int(existing_selected_port) if existing_selected_port else find_available_port(configured_port)
+    os.environ["APP_SELECTED_PORT"] = str(selected_port)
+    if selected_port != configured_port:
+        print(
+            f"Port {configured_port} is already in use. "
+            f"Starting on http://127.0.0.1:{selected_port} instead."
+        )
+    app.run(debug=True, host="127.0.0.1", port=selected_port)
