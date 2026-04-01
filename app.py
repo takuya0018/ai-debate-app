@@ -868,15 +868,10 @@ def ask_fallback_reviewer(content: str, topic: str, results: List[Dict[str, str]
                     "あなたは建設的なレビュアーです。ChatGPT の回答を評価する際は次の形式を厳守してください:\n"
                     "問題がなければ 【COMPLETED】 とだけ返してください。\n\n"
                     "問題がある場合:\n"
-                    "**いいところ:**\n"
-                    "- 良い点1\n"
-                    "- 良い点2\n\n"
-                    "**改善点:**\n"
-                    "- 改善すべき点1\n"
-                    "- 改善すべき点2\n\n"
-                    "**修正方針:**\n"
-                    "- 対応1\n"
-                    "- 対応2"
+                    "[GEMINI_ISSUES]\n"
+                    "- 問題点や改善すべき点を具体的に列挙（2〜5項目）\n\n"
+                    "[GEMINI_ANSWER]\n"
+                    "あなたとしての最善の回答（参照情報と知識を踏まえた完全な回答本文）"
                 ),
             },
             {
@@ -934,7 +929,7 @@ def ask_fallback_initial_answer(topic: str, results: List[Dict[str, str]], provi
         }
 
 
-def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider: str, is_initial: bool = False) -> Dict[str, Any]:
+def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider: str, is_initial: bool = False, prev_gemini_answer: str = "") -> Dict[str, Any]:
     if not GEMINI_API_KEY:
         if is_initial:
             return ask_fallback_initial_answer(topic, results, provider, "missing_api_key")
@@ -956,20 +951,20 @@ def ask_gemini(content: str, topic: str, results: List[Dict[str, str]], provider
             "上の参照情報を踏まえて、ユーザーの依頼に回答してください。"
         )
     else:
+        prev_note = (
+            f"\nあなたの前回の回答（参考・進化の参照）:\n{prev_gemini_answer}\n\n"
+            if prev_gemini_answer else ""
+        )
         prompt_text = (
-            "あなたは建設的なレビュアーです。ChatGPT の回答を評価する際は次の形式を厳守してください:\n"
-            "問題がなければ 【COMPLETED】 とだけ返してください。\n\n"
-            "問題がある場合:\n"
-            "**いいところ:**\n"
-            "- 良い点1\n"
-            "- 良い点2\n\n"
-            "**改善点:**\n"
-            "- 改善すべき点1\n"
-            "- 改善すべき点2\n\n"
-            "**修正方針:**\n"
-            "- 対応1\n"
-            "- 対応2\n\n"
-            f"ユーザー要望:\n{topic}\n\n"
+            "あなたはGeminiです。ChatGPTの回答をレビューし、以下の形式で回答してください。\n\n"
+            "ChatGPTの回答に問題がなければ 【COMPLETED】 とだけ返してください。\n\n"
+            "問題がある場合は必ず次の形式を厳守してください:\n\n"
+            "[GEMINI_ISSUES]\n"
+            "- 問題点や改善すべき点を具体的に列挙（2〜5項目）\n\n"
+            "[GEMINI_ANSWER]\n"
+            "Geminiとしての最善の回答（参照情報と知識を踏まえた完全な回答本文）\n\n"
+            + prev_note
+            + f"ユーザー要望:\n{topic}\n\n"
             f"参照情報 ({provider or 'search'}):\n{format_sources_for_prompt(results)}\n\n"
             f"ChatGPT の回答:\n{content}"
         )
@@ -1079,6 +1074,27 @@ def split_revision_output(text: str) -> Tuple[str, str]:
     plan = before.replace("[REVISION_PLAN]", "").strip()
     revised = after.strip()
     return plan, revised
+
+
+def split_gemini_output(text: str) -> Tuple[str, str]:
+    """Geminiのディベート出力を (issues, gemini_own_answer) に分割する。"""
+    content = str(text or "").strip()
+    if not content:
+        return "", ""
+
+    issues_marker = "[GEMINI_ISSUES]"
+    answer_marker = "[GEMINI_ANSWER]"
+
+    if issues_marker not in content or answer_marker not in content:
+        # 旧フォーマットまたは単純な批評 → 全文をissuesとして扱う
+        return content, ""
+
+    after_issues = content.split(issues_marker, 1)[1]
+    if answer_marker in after_issues:
+        issues_part, answer_part = after_issues.split(answer_marker, 1)
+        return issues_part.strip(), answer_part.strip()
+
+    return after_issues.strip(), ""
 
 
 @app.get("/")
@@ -1264,8 +1280,9 @@ def ask() -> Any:
                 new_messages.append(chatgpt_message)
                 save_history(history)
 
+                prev_gemini_answer = ""
                 for round_index in range(rounds):
-                    gemini_result = ask_gemini(current_answer, topic, search_results, provider)
+                    gemini_result = ask_gemini(current_answer, topic, search_results, provider, prev_gemini_answer=prev_gemini_answer)
                     feedback = gemini_result["content"]
 
                     gemini_message = make_message(
@@ -1285,19 +1302,23 @@ def ask() -> Any:
                     if config["settings"]["finish_keyword"] in feedback:
                         break
 
+                    gemini_issues, gemini_own_answer = split_gemini_output(feedback)
+                    prev_gemini_answer = gemini_own_answer or feedback
+
                     revision_prompt = (
                         f"元のユーザー要望:\n{topic}\n\n"
-                        f"前回のChatGPT回答:\n{current_answer}\n\n"
-                        f"Gemini の指摘:\n{feedback}\n\n"
-                        "次のルールで回答を全面修正してください。\n"
-                        "- Gemini の指摘を1つ残らず反映する\n"
+                        f"あなたの前回の回答:\n{current_answer}\n\n"
+                        f"Gemini の指摘:\n{gemini_issues or feedback}\n\n"
+                        + (f"Gemini 自身の回答（比較・取り込み対象）:\n{gemini_own_answer}\n\n" if gemini_own_answer else "")
+                        + "次のルールで回答を改訂してください。\n"
+                        "- Gemini の指摘をすべて反映する\n"
+                        "- Gemini の独自回答に優れた観点や表現があれば積極的に取り入れる\n"
                         "- 事実誤認、重複、正式名称のズレを必ず直す\n"
-                        "- 正式な一覧や個数を求められている場合は、誤りがある項目は削除または修正する\n"
                         "- 検索結果で裏づけられない推測は書かない\n"
                         "- 出力形式を厳守する\n\n"
                         "出力形式:\n"
                         "[REVISION_PLAN]\n"
-                        "- 指摘と対応を1対1で短く列挙\n"
+                        "- Geminiの指摘への対応と、Geminiの回答から取り入れた点を列挙\n"
                         "- 2-5項目\n\n"
                         "[REVISED_ANSWER]\n"
                         "(修正後の回答本文のみ)"
